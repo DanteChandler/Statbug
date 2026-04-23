@@ -17,18 +17,15 @@ try {
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "CHANGE_GAME") {
     CURRENT_GAME_ID = msg.gameId
-    dataBuffer = [] // Clear old data when switching games
+    dataBuffer = []
     fetchGameData()
   }
-
   if (msg.type === "SET_LATENCY") {
     latencyDelayMs = msg.seconds * 1000
     chrome.storage.local.set({ delaySeconds: msg.seconds })
   }
-
   if (msg.type === "SET_DISPLAY_MODE") {
-    // Forward the mode change directly to all NBA tabs immediately (bypassing the delay buffer)
-    chrome.tabs.query({ url: "https://www.nba.com/*" }, (tabs) => {
+    chrome.tabs.query({ url: "*://*.nba.com/*" }, (tabs) => {
       for (const tab of tabs) {
         if (tab.id) chrome.tabs.sendMessage(tab.id, { type: "SET_DISPLAY_MODE", mode: msg.mode }).catch(() => {})
       }
@@ -40,11 +37,12 @@ chrome.runtime.onMessage.addListener((msg) => {
 const getOnCourtPlayers = (team: any) => {
   return team.players
     .filter((p: any) => p.oncourt === "1")
-    .slice(0, 5) // Ensure we only ever grab a max of 5 players
+    .slice(0, 5)
     .map((p: any) => ({
       id: p.personId,
       name: p.nameI,
-      // Position abbreviation shown on the player card (PG, SG, SF, PF, C)
+      // Jersey number shown as a small badge next to the name
+      number: p.jerseyNum || "",
       position: p.position || "",
       pts: p.statistics.points,
       reb: p.statistics.reboundsTotal,
@@ -65,6 +63,34 @@ const getOnCourtPlayers = (team: any) => {
     }))
 }
 
+// Helper to build team-level stats for the team stats drawer
+const getTeamStats = (team: any) => ({
+  fgm: team.statistics.fieldGoalsMade,
+  fga: team.statistics.fieldGoalsAttempted,
+  fgPct: team.statistics.fieldGoalsPercentage
+    ? `${(team.statistics.fieldGoalsPercentage * 100).toFixed(1)}%` : "-",
+  tpm: team.statistics.threePointersMade,
+  tpa: team.statistics.threePointersAttempted,
+  tpPct: team.statistics.threePointersPercentage
+    ? `${(team.statistics.threePointersPercentage * 100).toFixed(1)}%` : "-",
+  ftm: team.statistics.freeThrowsMade,
+  fta: team.statistics.freeThrowsAttempted,
+  ftPct: team.statistics.freeThrowsPercentage
+    ? `${(team.statistics.freeThrowsPercentage * 100).toFixed(1)}%` : "-",
+  reb: team.statistics.reboundsTotal,
+  oreb: team.statistics.reboundsOffensive,
+  dreb: team.statistics.reboundsDefensive,
+  ast: team.statistics.assists,
+  tov: team.statistics.turnovers,
+  stl: team.statistics.steals,
+  blk: team.statistics.blocks,
+  pitp: team.statistics.pointsInThePaint,
+  fastBreak: team.statistics.pointsFastBreak,
+  secondChance: team.statistics.pointsSecondChance,
+  benchPts: team.statistics.benchPoints,
+  foulsTeam: team.statistics.foulsTeam,
+})
+
 // Main function to pull live data from NBA's static CDN
 const fetchGameData = async () => {
   if (!CURRENT_GAME_ID) return
@@ -73,13 +99,11 @@ const fetchGameData = async () => {
   const pbpUrl = `https://cdn.nba.com/static/json/liveData/playbyplay/playbyplay_${CURRENT_GAME_ID}.json`
 
   try {
-    // 1. Fetch Boxscore (Scores, Clock, Player Stats)
     const boxRes = await fetch(boxUrl)
     const boxData = await boxRes.json()
     const game = boxData.game
 
-    // 2. Fetch Play-by-Play (Text descriptions of what just happened)
-    let actions = []
+    let actions: any[] = []
     try {
       const pbpRes = await fetch(pbpUrl)
       if (pbpRes.ok && pbpRes.headers.get("content-type")?.includes("application/json")) {
@@ -90,43 +114,55 @@ const fetchGameData = async () => {
       console.warn("PBP not available")
     }
 
-    // Find the most recent play description by iterating backwards through the actions array
-    let latestPlayText = game.gameStatus === 1 ? "Awaiting tip-off..." : "Waiting for play data..."
-    for (let i = actions.length - 1; i >= 0; i--) {
-      if (actions[i].description) {
-        latestPlayText = actions[i].description
-        break
+    // Grab the last 5 plays with descriptions for the play-by-play ticker
+    const recentPlays: { text: string, clock: string, period: number }[] = []
+    for (let i = actions.length - 1; i >= 0 && recentPlays.length < 5; i--) {
+      const a = actions[i]
+      if (a.description) {
+        recentPlays.push({
+          text: a.description,
+          // Game clock at the time the play happened
+          clock: a.clock || "",
+          period: a.period || 0
+        })
       }
     }
 
-    // Construct the standardized payload for the front-end overlay
+    const latestPlay = recentPlays[0] || { text: game.gameStatus === 1 ? "Awaiting tip-off..." : "Waiting for play data...", clock: "", period: 0 }
+
     const payload = {
       type: "UPDATE_BOXSCORE",
       clock: game.gameClock,
       period: game.period,
       gameStatus: game.gameStatus,
-      latestPlay: latestPlayText,
+      // Most recent play for the ticker
+      latestPlay: latestPlay.text,
+      latestPlayClock: latestPlay.clock,
+      latestPlayPeriod: latestPlay.period,
       awayTeam: {
         score: game.awayTeam.score,
         tricode: game.awayTeam.teamTricode,
+        name: game.awayTeam.teamName,
         timeouts: game.awayTeam.timeoutsRemaining,
         fouls: game.awayTeam.statistics.foulsTeam,
         inBonus: game.awayTeam.inBonus == 1,
-        onCourt: getOnCourtPlayers(game.awayTeam)
+        onCourt: getOnCourtPlayers(game.awayTeam),
+        // Full team stats for the slide-down drawer
+        teamStats: getTeamStats(game.awayTeam)
       },
       homeTeam: {
         score: game.homeTeam.score,
         tricode: game.homeTeam.teamTricode,
+        name: game.homeTeam.teamName,
         timeouts: game.homeTeam.timeoutsRemaining,
         fouls: game.homeTeam.statistics.foulsTeam,
         inBonus: game.homeTeam.inBonus == 1,
-        onCourt: getOnCourtPlayers(game.homeTeam)
+        onCourt: getOnCourtPlayers(game.homeTeam),
+        teamStats: getTeamStats(game.homeTeam)
       }
     }
 
-    // Store the payload in the buffer with a timestamp instead of sending it immediately
     dataBuffer.push({ timestamp: Date.now(), payload })
-    // Keep memory clean by limiting the buffer to the last 120 payloads (~10 mins at 5s intervals)
     if (dataBuffer.length > 120) dataBuffer.shift()
 
   } catch (e) {
@@ -134,32 +170,22 @@ const fetchGameData = async () => {
   }
 }
 
-// Broadcaster Interval: Runs every second to send data to the active web pages
+// Broadcaster: runs every second, applies the user's latency delay
 setInterval(() => {
   if (dataBuffer.length === 0) return
-
-  // Calculate what time we *should* be displaying based on the user's sync delay setting
   const targetTime = Date.now() - latencyDelayMs
   let closestPayload = dataBuffer[0].payload
   let smallestDiff = Infinity
-
-  // Find the payload in the buffer that closest matches our target delayed time
   for (const item of dataBuffer) {
     const diff = Math.abs(item.timestamp - targetTime)
-    if (diff < smallestDiff) {
-      smallestDiff = diff
-      closestPayload = item.payload
-    }
+    if (diff < smallestDiff) { smallestDiff = diff; closestPayload = item.payload }
   }
-
-  // Send the delayed payload to any open NBA.com tabs
-  chrome.tabs.query({ url: "https://www.nba.com/*" }, (tabs) => {
+  chrome.tabs.query({ url: "*://*.nba.com/*" }, (tabs) => {
     for (const tab of tabs) {
       if (tab.id) chrome.tabs.sendMessage(tab.id, closestPayload).catch(() => {})
     }
   })
 }, 1000)
 
-// Start the fetching loop: fetch immediately on boot, then every 5 seconds
 fetchGameData()
 setInterval(fetchGameData, 5000)
