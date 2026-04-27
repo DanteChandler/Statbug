@@ -199,17 +199,6 @@ export default function ScorebugOverlay() {
     const awayColor = NBA_COLORS[data.awayTeam.tricode] || "#333"
     const homeColor = NBA_COLORS[data.homeTeam.tricode] || "#333"
 
-    // Small pill badge used for position and jersey number
-    const Pill = ({ text }: { text: string }) => (
-      <span style={{
-        fontSize: "8px", fontWeight: 800,
-        color: "rgba(255,255,255,0.6)",
-        backgroundColor: "rgba(0,0,0,0.4)",
-        borderRadius: "3px", padding: "1px 4px",
-        flexShrink: 0, letterSpacing: "0.3px"
-      }}>{text}</span>
-    )
-
     // Timeout dots — filled yellow up to the number of timeouts remaining
     const TimeoutDots = ({ count }: { count: number }) => (
       <div style={{ display: "flex", gap: "3px", alignItems: "center" }}>
@@ -254,7 +243,8 @@ export default function ScorebugOverlay() {
           padding: "10px 10px 8px",
           display: "grid",
           gridTemplateColumns: "1fr 1fr 1fr",
-          gap: "4px 6px"
+          gap: "4px 6px",
+          boxShadow: "0 6px 20px rgba(0,0,0,0.8)"
         }}>
           {rows.map(({ label, value }) => (
             <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
@@ -299,36 +289,56 @@ export default function ScorebugOverlay() {
                 transition: "background-color 0.3s"
               }} />
 
-              {/* Player headshot from NBA CDN */}
-              <img
-                src={`https://cdn.nba.com/headshots/nba/latest/260x190/${p.id}.png`}
-                style={{
-                  height: "70px", width: "55px", objectFit: "cover",
-                  objectPosition: "top center", flexShrink: 0,
-                  filter: isScorer ? "drop-shadow(0 0 6px #ffdd00)" : "drop-shadow(0 1px 3px rgba(0,0,0,0.8))",
-                  transition: "filter 0.3s"
-                }}
-                alt=""
-                onError={(e) => { e.currentTarget.style.display = "none" }}
-              />
+              {/* Player headshot with jersey number and position overlaid as badges */}
+              <div style={{ position: "relative", flexShrink: 0, height: "70px", width: "55px" }}>
+                <img
+                  src={`https://cdn.nba.com/headshots/nba/latest/260x190/${p.id}.png`}
+                  style={{
+                    height: "70px", width: "55px", objectFit: "cover",
+                    objectPosition: "top center",
+                    filter: isScorer ? "drop-shadow(0 0 6px #ffdd00)" : "drop-shadow(0 1px 3px rgba(0,0,0,0.8))",
+                    transition: "filter 0.3s", display: "block"
+                  }}
+                  alt=""
+                  onError={(e) => { e.currentTarget.style.display = "none" }}
+                />
+                {/* Jersey number — bottom left corner of the photo */}
+                {p.number && (
+                  <span style={{
+                    position: "absolute", bottom: "2px", left: "2px",
+                    fontSize: "8px", fontWeight: 800,
+                    color: "white",
+                    backgroundColor: "rgba(0,0,0,0.75)",
+                    borderRadius: "3px", padding: "1px 3px",
+                    letterSpacing: "0.3px", lineHeight: 1
+                  }}>#{p.number}</span>
+                )}
+                {/* Position — bottom right corner of the photo */}
+                {p.position && (
+                  <span style={{
+                    position: "absolute", bottom: "2px", right: "2px",
+                    fontSize: "8px", fontWeight: 800,
+                    color: "white",
+                    backgroundColor: "rgba(0,0,0,0.75)",
+                    borderRadius: "3px", padding: "1px 3px",
+                    letterSpacing: "0.3px", lineHeight: 1
+                  }}>{p.position}</span>
+                )}
+              </div>
 
-              {/* Text block: name row + PTS/REB row + AST/PF row */}
+              {/* Text block: name on row 1, PTS+REB on row 2, AST+PF on row 3 */}
               <div style={{
                 display: "flex", flexDirection: "column", justifyContent: "center",
                 paddingLeft: "5px", paddingRight: "3px", minWidth: 0, flex: 1, gap: "2px"
               }}>
-                {/* Row 1: Name + jersey number pill + position pill */}
-                <div style={{ display: "flex", alignItems: "center", gap: "3px", minWidth: 0 }}>
-                  <span style={{
-                    fontSize: "11px", fontWeight: 900,
-                    color: isScorer ? "#ffdd00" : "white",
-                    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
-                    textTransform: "uppercase", letterSpacing: "0.2px",
-                    textShadow: "0 1px 3px rgba(0,0,0,1)", lineHeight: 1, flex: 1, minWidth: 0
-                  }}>{p.name}</span>
-                  {p.number && <Pill text={`#${p.number}`} />}
-                  {p.position && <Pill text={p.position} />}
-                </div>
+                {/* Row 1: Name only — now has full width since badges moved to photo */}
+                <span style={{
+                  fontSize: "11px", fontWeight: 900,
+                  color: isScorer ? "#ffdd00" : "white",
+                  whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                  textTransform: "uppercase", letterSpacing: "0.2px",
+                  textShadow: "0 1px 3px rgba(0,0,0,1)", lineHeight: 1
+                }}>{p.name}</span>
 
                 {/* Row 2: Points + Rebounds */}
                 <div style={{ display: "flex", gap: "4px", alignItems: "baseline" }}>
@@ -343,7 +353,7 @@ export default function ScorebugOverlay() {
                   <span style={{ fontSize: "9px", color: "rgba(255,255,255,0.55)", fontWeight: 700 }}>REB</span>
                 </div>
 
-                {/* Row 3: Assists + Personal Fouls (colour-coded at 4 and 5) */}
+                {/* Row 3: Assists + Personal Fouls — PF turns yellow at 4, red at 5 */}
                 <div style={{ display: "flex", gap: "4px", alignItems: "baseline" }}>
                   <span style={{ fontSize: "15px", fontWeight: 800, color: "rgba(255,255,255,0.9)", lineHeight: 1, textShadow: "0 1px 3px rgba(0,0,0,0.9)" }}>{p.ast}</span>
                   <span style={{ fontSize: "9px", color: "rgba(255,255,255,0.55)", fontWeight: 700, marginRight: "2px" }}>AST</span>
@@ -407,11 +417,11 @@ export default function ScorebugOverlay() {
         color: "white", fontFamily: "'Arial Black', Arial, sans-serif",
         display: "flex", flexDirection: "column",
         zIndex: 2147483647, pointerEvents: "none",
-        boxShadow: "0 6px 30px rgba(0,0,0,0.9)"
       }}>
 
         {/* ── Row 1: Player cards ── */}
-        <div style={{ display: "flex", alignItems: "flex-start", height: "75px" }}>
+        <div style={{ display: "flex", alignItems: "flex-start", height: "75px",
+          boxShadow: "0 4px 20px rgba(0,0,0,0.8)" }}>
           {/* Away team players */}
           <div style={{ display: "flex", flex: 1, minWidth: 0, pointerEvents: "auto", alignSelf: "flex-start" }}>
             {renderTeamPlayers(data.awayTeam.onCourt || [], awayColor)}
@@ -428,7 +438,8 @@ export default function ScorebugOverlay() {
         {/* Left quarter: away team tab (click to open team stats drawer) */}
         {/* Middle half: play-by-play ticker with game clock */}
         {/* Right quarter: home team tab */}
-        <div style={{ display: "flex", height: "28px", pointerEvents: "auto" }}>
+        <div style={{ display: "flex", height: "28px", pointerEvents: "auto",
+          boxShadow: "0 4px 12px rgba(0,0,0,0.7)" }}>
 
           {/* Away team tab — shows team name, foul count or BONUS, timeout dots */}
           <div
@@ -525,17 +536,20 @@ export default function ScorebugOverlay() {
         {/* Both can be open at once, both close when clicking outside */}
         {expandedTeamStats.size > 0 && (
           <div style={{ display: "flex", pointerEvents: "auto" }}>
-            {/* Away drawer — always on the left half */}
+            {/* Away drawer — left half only, invisible placeholder when closed so home stays right */}
             <div style={{ flex: 1, overflow: "hidden" }}>
-              {expandedTeamStats.has("away") && (
-                <TeamStatsDrawer team={data.awayTeam} color={awayColor} />
-              )}
+              {expandedTeamStats.has("away")
+                ? <TeamStatsDrawer team={data.awayTeam} color={awayColor} />
+                // Empty div keeps the home drawer pinned to the right half when only home is open
+                : <div style={{ height: expandedTeamStats.has("home") ? "auto" : 0 }} />
+              }
             </div>
-            {/* Home drawer — always on the right half */}
+            {/* Home drawer — right half only, invisible placeholder when closed */}
             <div style={{ flex: 1, overflow: "hidden" }}>
-              {expandedTeamStats.has("home") && (
-                <TeamStatsDrawer team={data.homeTeam} color={homeColor} />
-              )}
+              {expandedTeamStats.has("home")
+                ? <TeamStatsDrawer team={data.homeTeam} color={homeColor} />
+                : <div style={{ height: expandedTeamStats.has("away") ? "auto" : 0 }} />
+              }
             </div>
           </div>
         )}
