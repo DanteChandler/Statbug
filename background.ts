@@ -25,7 +25,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     chrome.storage.local.set({ delaySeconds: msg.seconds })
   }
   if (msg.type === "SET_DISPLAY_MODE") {
-    chrome.tabs.query({ url: "*://*.nba.com/*" }, (tabs) => {
+    chrome.tabs.query({ url: "<all_urls>" }, (tabs) => {
       for (const tab of tabs) {
         if (tab.id) chrome.tabs.sendMessage(tab.id, { type: "SET_DISPLAY_MODE", mode: msg.mode }).catch(() => {})
       }

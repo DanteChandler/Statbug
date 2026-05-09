@@ -3,7 +3,7 @@ import type { PlasmoCSConfig, PlasmoGetRootContainer } from "plasmo"
 
 // Inject this content script only on NBA.com pages
 export const config: PlasmoCSConfig = {
-  matches: ["*://*.nba.com/*"]
+  matches: ["<all_urls>"]
 }
 
 // Set up a custom root container for the React tree.
@@ -22,7 +22,7 @@ export const getRootContainer: PlasmoGetRootContainer = async () => {
   return root
 }
 
-// Primary colour for each NBA team — used to tint player cards and gradients
+// Primary colour for each NBA team
 const NBA_COLORS: Record<string, string> = {
   ATL: "#E03A3E", BOS: "#007A33", BKN: "#222222", CHA: "#1D1160",
   CHI: "#CE1141", CLE: "#860038", DAL: "#00538C", DEN: "#0E2240",
@@ -34,10 +34,16 @@ const NBA_COLORS: Record<string, string> = {
   UTA: "#002B5C", WAS: "#002B5C"
 }
 
-// Display modes: off hides everything, scorebug is the bottom bar, statbug is the top bar
 type DisplayMode = "off" | "scorebug" | "statbug"
 
-// Formats an ISO clock string (e.g. "PT05M30.00S") into a readable "Q3 5:30" label
+// Which stat is currently being highlighted on a player, and what type of event triggered it
+type StatEvent = {
+  playerId: string
+  stat: "blk" | "stl" | "tov" | "foul4" | "foul5"
+  expiresAt: number
+}
+
+// Formats an ISO clock string into a readable "Q3 5:30" label
 const formatPlayClock = (clock: string, period: number): string => {
   if (!clock || !period) return ""
   const match = clock.match(/PT(\d+)M(\d+\.?\d*)S/)
@@ -49,22 +55,27 @@ const formatPlayClock = (clock: string, period: number): string => {
 }
 
 export default function ScorebugOverlay() {
-  // --- State Management ---
   const [data, setData] = useState<any>(null)
   const [displayMode, setDisplayMode] = useState<DisplayMode>("scorebug")
   const [displayClock, setDisplayClock] = useState<string>("")
-
-  // Which player card is currently expanded to show detailed stats
   const [expandedPlayerId, setExpandedPlayerId] = useState<string | null>(null)
-
-  // Set allows both teams to be open simultaneously
   const [expandedTeamStats, setExpandedTeamStats] = useState<Set<string>>(new Set())
 
-  // Scoring animation state — highlights the player and team that just scored
+  // Scoring animation — which player and team just scored
   const [scoringPlayerId, setScoringPlayerId] = useState<string | null>(null)
   const [scoringTricode, setScoringTricode] = useState<string | null>(null)
 
-  // Refs for clock interpolation and previous data comparison
+  // Stat event animation — tracks the most recent non-scoring stat event per player
+  // Key is playerId, value is the active event
+  const [statEvents, setStatEvents] = useState<Map<string, StatEvent>>(new Map())
+
+  // Rebound/assist flash — brief positive animation
+  const [rebFlashId, setRebFlashId] = useState<string | null>(null)
+  const [astFlashId, setAstFlashId] = useState<string | null>(null)
+
+  // Window width for compact mode detection — compact below 900px
+  const [windowWidth, setWindowWidth] = useState(window.innerWidth)
+
   const prevDataRef = useRef<any>(null)
   const clockAnchorRef = useRef<{
     seconds: number
@@ -72,13 +83,10 @@ export default function ScorebugOverlay() {
     running: boolean
     lastClockStr: string
   } | null>(null)
-
-  // Ref on the statbug bar so clicks outside it close any open drawers
   const statBugRef = useRef<HTMLDivElement>(null)
+  // Timers for stat events so we can reset them on repeat events
+  const statEventTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
 
-  // --- Utility Functions ---
-
-  // Converts "PT12M30.00S" into total seconds for clock interpolation
   const clockToSeconds = (clockStr: string): number => {
     if (!clockStr) return 0
     const match = clockStr.match(/PT(\d+)M(\d+\.?\d*)S/)
@@ -86,7 +94,6 @@ export default function ScorebugOverlay() {
     return parseInt(match[1]) * 60 + parseFloat(match[2])
   }
 
-  // Formats raw seconds into MM:SS or S.s when under a minute
   const secondsToDisplay = (secs: number): string => {
     if (secs <= 0) return "0:00"
     const m = Math.floor(secs / 60)
@@ -95,7 +102,6 @@ export default function ScorebugOverlay() {
     return `${m}:${Math.floor(s).toString().padStart(2, "0")}`
   }
 
-  // Fallback clock formatter used before the ticker kicks in
   const formatClock = (clockStr: string): string => {
     if (!clockStr) return "00:00"
     const match = clockStr.match(/PT(\d+)M(\d+\.?\d*)S/)
@@ -108,26 +114,46 @@ export default function ScorebugOverlay() {
     return clockStr
   }
 
-  // --- Effects ---
+  // Triggers a stat event on a player — resets the 10s timer if they already have one
+  const triggerStatEvent = (playerId: string, stat: StatEvent["stat"]) => {
+    // Clear existing timer for this player if there is one
+    const existing = statEventTimers.current.get(playerId)
+    if (existing) clearTimeout(existing)
+
+    const expiresAt = Date.now() + 10000
+    setStatEvents(prev => new Map(prev).set(playerId, { playerId, stat, expiresAt }))
+
+    // Auto-clear after 10 seconds
+    const timer = setTimeout(() => {
+      setStatEvents(prev => {
+        const next = new Map(prev)
+        next.delete(playerId)
+        return next
+      })
+      statEventTimers.current.delete(playerId)
+    }, 10000)
+    statEventTimers.current.set(playerId, timer)
+  }
+
   useEffect(() => {
-    // Restore the user's preferred display mode on mount
+    // Track window width for compact mode
+    const handleResize = () => setWindowWidth(window.innerWidth)
+    window.addEventListener("resize", handleResize)
+
     try {
       chrome.storage.local.get(["displayMode"], (result) => {
         if (result.displayMode) setDisplayMode(result.displayMode)
       })
     } catch (e) {}
 
-    // Close any open player/team drawers when clicking outside the statbug bar
     const handleClickOutside = (e: MouseEvent) => {
       if (statBugRef.current && !statBugRef.current.contains(e.target as Node)) {
         setExpandedPlayerId(null)
-        // Clear the Set so both drawers close together
         setExpandedTeamStats(new Set())
       }
     }
     document.addEventListener("mousedown", handleClickOutside)
 
-    // Handle incoming messages from the background script
     const handleMessage = (msg: any) => {
       if (msg.type === "SET_DISPLAY_MODE") {
         setDisplayMode(msg.mode)
@@ -137,28 +163,53 @@ export default function ScorebugOverlay() {
 
       const prev = prevDataRef.current
 
-      // Check if either team scored and trigger the scoring animation
       if (prev) {
-        if (msg.awayTeam.score > prev.awayTeam.score) {
-          setScoringTricode(msg.awayTeam.tricode)
-          const scorer = msg.awayTeam.onCourt?.find((p: any) => {
-            const pp = prev.awayTeam.onCourt?.find((x: any) => x.id === p.id)
-            return pp && p.pts > pp.pts
+        // Helper to detect stat changes on a team's on-court players
+        const detectStatChanges = (currTeam: any, prevTeam: any) => {
+          currTeam.onCourt?.forEach((p: any) => {
+            const pp = prevTeam.onCourt?.find((x: any) => x.id === p.id)
+            if (!pp) return
+
+            // Scoring animation
+            if (p.pts > pp.pts) {
+              setScoringTricode(currTeam.tricode)
+              setScoringPlayerId(p.id)
+              setTimeout(() => { setScoringPlayerId(null); setScoringTricode(null) }, 2000)
+            }
+
+            // Rebound flash — brief green
+            if (p.reb > pp.reb) {
+              setRebFlashId(p.id)
+              setTimeout(() => setRebFlashId(null), 1500)
+            }
+
+            // Assist flash — brief teal
+            if (p.ast > pp.ast) {
+              setAstFlashId(p.id)
+              setTimeout(() => setAstFlashId(null), 1500)
+            }
+
+            // Block — triggers rotating 4th stat for 10s
+            if (p.blk > pp.blk) triggerStatEvent(p.id, "blk")
+
+            // Steal — triggers rotating 4th stat for 10s
+            if (p.stl > pp.stl) triggerStatEvent(p.id, "stl")
+
+            // Turnover — triggers rotating 4th stat for 10s (negative)
+            if (p.tov > pp.tov) triggerStatEvent(p.id, "tov")
+
+            // Foul danger (4th foul)
+            if (p.fouls === 4 && pp.fouls < 4) triggerStatEvent(p.id, "foul4")
+
+            // Fouled out (5th foul)
+            if (p.fouls >= 5 && pp.fouls < 5) triggerStatEvent(p.id, "foul5")
           })
-          setScoringPlayerId(scorer?.id ?? null)
-          setTimeout(() => { setScoringPlayerId(null); setScoringTricode(null) }, 2000)
-        } else if (msg.homeTeam.score > prev.homeTeam.score) {
-          setScoringTricode(msg.homeTeam.tricode)
-          const scorer = msg.homeTeam.onCourt?.find((p: any) => {
-            const pp = prev.homeTeam.onCourt?.find((x: any) => x.id === p.id)
-            return pp && p.pts > pp.pts
-          })
-          setScoringPlayerId(scorer?.id ?? null)
-          setTimeout(() => { setScoringPlayerId(null); setScoringTricode(null) }, 2000)
         }
+
+        detectStatChanges(msg.awayTeam, prev.awayTeam)
+        detectStatChanges(msg.homeTeam, prev.homeTeam)
       }
 
-      // Set the clock anchor so the local ticker can interpolate smoothly
       const isGameLive = msg.gameStatus === 2
       const clockIsZero = msg.clock === "PT00M00.00S" || !msg.clock
       const clockChanged = !clockAnchorRef.current || msg.clock !== clockAnchorRef.current.lastClockStr
@@ -175,7 +226,6 @@ export default function ScorebugOverlay() {
 
     chrome.runtime.onMessage.addListener(handleMessage)
 
-    // Tick every 100ms to smoothly count the clock down between API updates
     const ticker = setInterval(() => {
       const anchor = clockAnchorRef.current
       if (!anchor || !anchor.running) return
@@ -188,18 +238,23 @@ export default function ScorebugOverlay() {
     return () => {
       chrome.runtime.onMessage.removeListener(handleMessage)
       document.removeEventListener("mousedown", handleClickOutside)
+      window.removeEventListener("resize", handleResize)
       clearInterval(ticker)
+      // Clear all stat event timers on unmount
+      statEventTimers.current.forEach(t => clearTimeout(t))
     }
   }, [])
 
   if (!data || displayMode === "off") return null
 
-  // ── STATBUG MODE (Top Bar) ────────────────────────────────────────────────────
+  // ── STATBUG MODE ─────────────────────────────────────────────────────────────
   if (displayMode === "statbug") {
     const awayColor = NBA_COLORS[data.awayTeam.tricode] || "#333"
     const homeColor = NBA_COLORS[data.homeTeam.tricode] || "#333"
 
-    // Timeout dots — filled yellow up to the number of timeouts remaining
+    // Compact mode kicks in below 900px — switches to vertical card layout
+    const isCompact = windowWidth < 900
+
     const TimeoutDots = ({ count }: { count: number }) => (
       <div style={{ display: "flex", gap: "3px", alignItems: "center" }}>
         {Array.from({ length: 7 }).map((_, i) => (
@@ -212,10 +267,8 @@ export default function ScorebugOverlay() {
       </div>
     )
 
-    // Slide-down team stats drawer — shows full team shooting and misc stats
     const TeamStatsDrawer = ({ team, color }: { team: any, color: string }) => {
       const s = team.teamStats
-      // Stats shown in a 3-column grid inside the drawer
       const rows = [
         { label: "FG", value: `${s.fgm}/${s.fga}` },
         { label: "FG%", value: s.fgPct },
@@ -256,20 +309,163 @@ export default function ScorebugOverlay() {
       )
     }
 
-    // Renders the 5 player cards for one team
     const renderTeamPlayers = (players: any[], teamColor: string) =>
       players.map((p: any, i: number) => {
         const isScorer = scoringPlayerId === p.id
         const isExpanded = expandedPlayerId === p.id
+        const isRebFlash = rebFlashId === p.id
+        const isAstFlash = astFlashId === p.id
+        const activeEvent = statEvents.get(p.id)
         const cardBg = i % 2 === 0 ? `${teamColor}ff` : `${teamColor}ee`
 
+        // The 4th stat rotates based on active event — defaults to PF
+        const fourthStat = activeEvent
+          ? {
+              blk: { label: "BLK", value: p.blk, color: "#00ff00", anim: "statGreenPulse 0.5s ease-out" },
+              stl: { label: "STL", value: p.stl, color: "#00ff00", anim: "statGreenPulse 0.5s ease-out" },
+              tov: { label: "TOV", value: p.tov, color: "#ff4757", anim: "statRedPulse 0.5s ease-out" },
+              foul4: { label: "PF", value: p.fouls, color: "#ffdd00", anim: "statYellowPulse 0.5s ease-out" },
+              foul5: { label: "PF", value: p.fouls, color: "#ff4757", anim: "statRedPulse 0.5s ease-out" },
+            }[activeEvent.stat]
+          : { label: "PF", value: p.fouls, color: p.fouls >= 5 ? "#ff4757" : p.fouls >= 4 ? "#ffdd00" : "rgba(255,255,255,0.9)", anim: "none" }
+
+        // ── COMPACT CARD (vertical layout, used when window < 900px) ──
+        if (isCompact) {
+          return (
+            <div key={p.id} style={{
+              display: "flex", flexDirection: "column", alignItems: "center",
+              flex: "1 1 0", minWidth: 0, position: "relative",
+              borderRight: "1px solid rgba(0,0,0,0.4)",
+              cursor: "pointer",
+              backgroundColor: isExpanded ? `${teamColor}ff` : isScorer ? `${teamColor}ff` : cardBg,
+              backgroundImage: isExpanded || isScorer
+                ? `linear-gradient(160deg, rgba(255,221,0,0.18) 0%, transparent 60%), linear-gradient(to bottom, rgba(255,255,255,0.08) 0%, rgba(0,0,0,0.25) 100%)`
+                : `linear-gradient(160deg, rgba(255,255,255,0.07) 0%, transparent 55%), linear-gradient(to bottom, rgba(255,255,255,0.05) 0%, rgba(0,0,0,0.2) 100%)`,
+              // Top accent bar instead of left — gold when scoring
+              borderTop: `2px solid ${isScorer ? "#ffdd00" : isExpanded ? "#fff" : "transparent"}`,
+              overflow: "hidden",
+              paddingBottom: "3px"
+            }}
+              onClick={() => setExpandedPlayerId(isExpanded ? null : p.id)}
+            >
+              {/* Name — truncated */}
+              <span style={{
+                fontSize: "9px", fontWeight: 900,
+                color: isScorer ? "#ffdd00" : "white",
+                whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                textTransform: "uppercase", letterSpacing: "0.2px",
+                textShadow: "0 1px 3px rgba(0,0,0,1)", lineHeight: 1,
+                width: "100%", textAlign: "center", padding: "2px 2px 0"
+              }}>{p.name}</span>
+
+              {/* Headshot — fills width */}
+              <div style={{ position: "relative", width: "100%", flexShrink: 0 }}>
+                <img
+                  src={`https://cdn.nba.com/headshots/nba/latest/260x190/${p.id}.png`}
+                  style={{
+                    width: "100%", height: "45px",
+                    objectFit: "cover", objectPosition: "top center", display: "block",
+                    filter: isScorer ? "drop-shadow(0 0 6px #ffdd00)" : "drop-shadow(0 1px 3px rgba(0,0,0,0.8))",
+                    transition: "filter 0.3s"
+                  }}
+                  alt=""
+                  onError={(e) => { e.currentTarget.style.display = "none" }}
+                />
+                {/* Jersey badge — bottom left */}
+                {p.number && (
+                  <span style={{
+                    position: "absolute", bottom: "1px", left: "1px",
+                    fontSize: "7px", fontWeight: 800, color: "white",
+                    backgroundColor: "rgba(0,0,0,0.75)",
+                    borderRadius: "2px", padding: "0px 2px", lineHeight: 1
+                  }}>#{p.number}</span>
+                )}
+                {/* Position badge — bottom right */}
+                {p.position && (
+                  <span style={{
+                    position: "absolute", bottom: "1px", right: "1px",
+                    fontSize: "7px", fontWeight: 800, color: "white",
+                    backgroundColor: "rgba(0,0,0,0.75)",
+                    borderRadius: "2px", padding: "0px 2px", lineHeight: 1
+                  }}>{p.position}</span>
+                )}
+              </div>
+
+              {/* Row: PTS + REB */}
+              <div style={{ display: "flex", gap: "3px", alignItems: "baseline", padding: "1px 2px 0" }}>
+                <span style={{
+                  fontSize: "13px", fontWeight: 900,
+                  color: isScorer ? "#00ff00" : isRebFlash ? "white" : "white",
+                  lineHeight: 1, textShadow: "0 1px 3px rgba(0,0,0,0.9)",
+                  animation: isScorer ? "ptsPulse 0.6s ease-out" : "none"
+                }}>{p.pts}</span>
+                <span style={{ fontSize: "7px", color: "rgba(255,255,255,0.5)", fontWeight: 700 }}>P</span>
+                <span style={{
+                  fontSize: "11px", fontWeight: 800,
+                  color: isRebFlash ? "#00cc88" : "rgba(255,255,255,0.9)",
+                  lineHeight: 1, textShadow: "0 1px 3px rgba(0,0,0,0.9)",
+                  animation: isRebFlash ? "statGreenPulse 0.5s ease-out" : "none"
+                }}>{p.reb}</span>
+                <span style={{ fontSize: "7px", color: "rgba(255,255,255,0.5)", fontWeight: 700 }}>R</span>
+              </div>
+
+              {/* Row: AST + rotating 4th stat */}
+              <div style={{ display: "flex", gap: "3px", alignItems: "baseline", padding: "0 2px" }}>
+                <span style={{
+                  fontSize: "11px", fontWeight: 800,
+                  color: isAstFlash ? "#00ccff" : "rgba(255,255,255,0.9)",
+                  lineHeight: 1, textShadow: "0 1px 3px rgba(0,0,0,0.9)",
+                  animation: isAstFlash ? "statBluePulse 0.5s ease-out" : "none"
+                }}>{p.ast}</span>
+                <span style={{ fontSize: "7px", color: "rgba(255,255,255,0.5)", fontWeight: 700 }}>A</span>
+                <span style={{
+                  fontSize: "11px", fontWeight: 800, lineHeight: 1,
+                  color: fourthStat.color,
+                  textShadow: "0 1px 3px rgba(0,0,0,0.9)",
+                  animation: fourthStat.anim
+                }}>{fourthStat.value}</span>
+                <span style={{ fontSize: "7px", color: "rgba(255,255,255,0.5)", fontWeight: 700 }}>{fourthStat.label}</span>
+              </div>
+
+              {/* Expanded dropdown */}
+              {isExpanded && (
+                <div style={{
+                  position: "absolute", top: "100%", left: 0, right: 0,
+                  backgroundColor: `${teamColor}f0`,
+                  backgroundImage: `linear-gradient(to bottom, rgba(0,0,0,0.3) 0%, rgba(0,0,0,0.5) 100%)`,
+                  borderTop: "1px solid rgba(255,255,255,0.15)",
+                  padding: "6px", zIndex: 10,
+                  display: "grid", gridTemplateColumns: "1fr 1fr", gap: "2px 6px"
+                }}>
+                  {[
+                    { label: "MIN", value: p.min },
+                    { label: "FG", value: `${p.fgm}/${p.fga}` },
+                    { label: "3PT", value: `${p.tpm}/${p.tpa}` },
+                    { label: "FT", value: `${p.ftm}/${p.fta}` },
+                    { label: "OREB", value: p.oreb },
+                    { label: "STL", value: p.stl },
+                    { label: "BLK", value: p.blk },
+                    { label: "TO", value: p.tov },
+                    { label: "+/-", value: p.plusMinus > 0 ? `+${p.plusMinus}` : p.plusMinus },
+                  ].map(({ label, value }) => (
+                    <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                      <span style={{ fontSize: "8px", color: "rgba(255,255,255,0.5)", fontWeight: 700 }}>{label}</span>
+                      <span style={{ fontSize: "11px", fontWeight: 800, color: "white" }}>{value ?? "-"}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )
+        }
+
+        // ── STANDARD CARD (horizontal layout, used when window >= 900px) ──
         return (
           <div key={p.id} style={{
             display: "flex", flexDirection: "column",
             flex: "1 1 0", minWidth: 0, position: "relative",
             borderRight: "1px solid rgba(0,0,0,0.4)"
           }}>
-            {/* Clickable player card row */}
             <div
               onClick={() => setExpandedPlayerId(isExpanded ? null : p.id)}
               style={{
@@ -282,14 +478,14 @@ export default function ScorebugOverlay() {
                 transition: "background-color 0.3s ease"
               }}>
 
-              {/* Left accent bar — gold when scoring, white when expanded */}
+              {/* Left accent bar */}
               <div style={{
                 width: "3px", alignSelf: "stretch", flexShrink: 0,
                 backgroundColor: isExpanded ? "#ffffff" : isScorer ? "#ffdd00" : "rgba(255,255,255,0.2)",
                 transition: "background-color 0.3s"
               }} />
 
-              {/* Player headshot with jersey number and position overlaid as badges */}
+              {/* Headshot with badges */}
               <div style={{ position: "relative", flexShrink: 0, height: "70px", width: "55px" }}>
                 <img
                   src={`https://cdn.nba.com/headshots/nba/latest/260x190/${p.id}.png`}
@@ -302,36 +498,30 @@ export default function ScorebugOverlay() {
                   alt=""
                   onError={(e) => { e.currentTarget.style.display = "none" }}
                 />
-                {/* Jersey number — bottom left corner of the photo */}
                 {p.number && (
                   <span style={{
                     position: "absolute", bottom: "2px", left: "2px",
-                    fontSize: "8px", fontWeight: 800,
-                    color: "white",
+                    fontSize: "8px", fontWeight: 800, color: "white",
                     backgroundColor: "rgba(0,0,0,0.75)",
-                    borderRadius: "3px", padding: "1px 3px",
-                    letterSpacing: "0.3px", lineHeight: 1
+                    borderRadius: "3px", padding: "1px 3px", letterSpacing: "0.3px", lineHeight: 1
                   }}>#{p.number}</span>
                 )}
-                {/* Position — bottom right corner of the photo */}
                 {p.position && (
                   <span style={{
                     position: "absolute", bottom: "2px", right: "2px",
-                    fontSize: "8px", fontWeight: 800,
-                    color: "white",
+                    fontSize: "8px", fontWeight: 800, color: "white",
                     backgroundColor: "rgba(0,0,0,0.75)",
-                    borderRadius: "3px", padding: "1px 3px",
-                    letterSpacing: "0.3px", lineHeight: 1
+                    borderRadius: "3px", padding: "1px 3px", letterSpacing: "0.3px", lineHeight: 1
                   }}>{p.position}</span>
                 )}
               </div>
 
-              {/* Text block: name on row 1, PTS+REB on row 2, AST+PF on row 3 */}
+              {/* Text block */}
               <div style={{
                 display: "flex", flexDirection: "column", justifyContent: "center",
                 paddingLeft: "5px", paddingRight: "3px", minWidth: 0, flex: 1, gap: "2px"
               }}>
-                {/* Row 1: Name only — now has full width since badges moved to photo */}
+                {/* Name */}
                 <span style={{
                   fontSize: "11px", fontWeight: 900,
                   color: isScorer ? "#ffdd00" : "white",
@@ -340,7 +530,7 @@ export default function ScorebugOverlay() {
                   textShadow: "0 1px 3px rgba(0,0,0,1)", lineHeight: 1
                 }}>{p.name}</span>
 
-                {/* Row 2: Points + Rebounds */}
+                {/* PTS + REB */}
                 <div style={{ display: "flex", gap: "4px", alignItems: "baseline" }}>
                   <span style={{
                     fontSize: "18px", fontWeight: 900,
@@ -349,24 +539,35 @@ export default function ScorebugOverlay() {
                     animation: isScorer ? "ptsPulse 0.6s ease-out" : "none"
                   }}>{p.pts}</span>
                   <span style={{ fontSize: "9px", color: "rgba(255,255,255,0.55)", fontWeight: 700, marginRight: "2px" }}>PTS</span>
-                  <span style={{ fontSize: "15px", fontWeight: 800, color: "rgba(255,255,255,0.9)", lineHeight: 1, textShadow: "0 1px 3px rgba(0,0,0,0.9)" }}>{p.reb}</span>
+                  <span style={{
+                    fontSize: "15px", fontWeight: 800, lineHeight: 1,
+                    color: isRebFlash ? "#00cc88" : "rgba(255,255,255,0.9)",
+                    textShadow: "0 1px 3px rgba(0,0,0,0.9)",
+                    animation: isRebFlash ? "statGreenPulse 0.5s ease-out" : "none"
+                  }}>{p.reb}</span>
                   <span style={{ fontSize: "9px", color: "rgba(255,255,255,0.55)", fontWeight: 700 }}>REB</span>
                 </div>
 
-                {/* Row 3: Assists + Personal Fouls — PF turns yellow at 4, red at 5 */}
+                {/* AST + rotating 4th stat */}
                 <div style={{ display: "flex", gap: "4px", alignItems: "baseline" }}>
-                  <span style={{ fontSize: "15px", fontWeight: 800, color: "rgba(255,255,255,0.9)", lineHeight: 1, textShadow: "0 1px 3px rgba(0,0,0,0.9)" }}>{p.ast}</span>
+                  <span style={{
+                    fontSize: "15px", fontWeight: 800, lineHeight: 1,
+                    color: isAstFlash ? "#00ccff" : "rgba(255,255,255,0.9)",
+                    textShadow: "0 1px 3px rgba(0,0,0,0.9)",
+                    animation: isAstFlash ? "statBluePulse 0.5s ease-out" : "none"
+                  }}>{p.ast}</span>
                   <span style={{ fontSize: "9px", color: "rgba(255,255,255,0.55)", fontWeight: 700, marginRight: "2px" }}>AST</span>
                   <span style={{
                     fontSize: "15px", fontWeight: 800, lineHeight: 1,
-                    color: p.fouls >= 5 ? "#ff4757" : p.fouls >= 4 ? "#ffdd00" : "rgba(255,255,255,0.9)",
-                    textShadow: "0 1px 3px rgba(0,0,0,0.9)"
-                  }}>{p.fouls}</span>
-                  <span style={{ fontSize: "9px", color: "rgba(255,255,255,0.55)", fontWeight: 700 }}>PF</span>
+                    color: fourthStat.color,
+                    textShadow: "0 1px 3px rgba(0,0,0,0.9)",
+                    animation: fourthStat.anim
+                  }}>{fourthStat.value}</span>
+                  <span style={{ fontSize: "9px", color: "rgba(255,255,255,0.55)", fontWeight: 700 }}>{fourthStat.label}</span>
                 </div>
               </div>
 
-              {/* Chevron rotates when the card is expanded */}
+              {/* Chevron */}
               <span style={{
                 fontSize: "10px", color: "rgba(255,255,255,0.4)",
                 paddingRight: "4px", flexShrink: 0,
@@ -375,7 +576,7 @@ export default function ScorebugOverlay() {
               }}>▼</span>
             </div>
 
-            {/* Detailed stats dropdown — slides down when card is expanded */}
+            {/* Expanded dropdown */}
             {isExpanded && (
               <div style={{
                 position: "absolute", top: "75px", left: 0, right: 0,
@@ -408,8 +609,10 @@ export default function ScorebugOverlay() {
         )
       })
 
-    // The play clock label e.g. "Q3 4:22"
     const playClockLabel = formatPlayClock(data.latestPlayClock, data.latestPlayPeriod)
+
+    // Card row height differs between compact and standard
+    const cardRowHeight = isCompact ? "auto" : "75px"
 
     return (
       <div ref={statBugRef} style={{
@@ -418,34 +621,27 @@ export default function ScorebugOverlay() {
         display: "flex", flexDirection: "column",
         zIndex: 2147483647, pointerEvents: "none",
       }}>
-
         {/* ── Row 1: Player cards ── */}
-        <div style={{ display: "flex", alignItems: "flex-start", height: "75px",
-          boxShadow: "0 4px 20px rgba(0,0,0,0.8)" }}>
-          {/* Away team players */}
-          <div style={{ display: "flex", flex: 1, minWidth: 0, pointerEvents: "auto", alignSelf: "flex-start" }}>
+        <div style={{
+          display: "flex", alignItems: "flex-start",
+          height: cardRowHeight, minHeight: isCompact ? "85px" : "75px",
+          boxShadow: "0 4px 20px rgba(0,0,0,0.8)"
+        }}>
+          <div style={{ display: "flex", flex: 1, minWidth: 0, pointerEvents: "auto", alignSelf: "stretch" }}>
             {renderTeamPlayers(data.awayTeam.onCourt || [], awayColor)}
           </div>
-          {/* Divider between teams */}
-          <div style={{ width: "4px", backgroundColor: "#000", flexShrink: 0, height: "75px" }} />
-          {/* Home team players */}
-          <div style={{ display: "flex", flex: 1, minWidth: 0, pointerEvents: "auto", alignSelf: "flex-start" }}>
+          <div style={{ width: "4px", backgroundColor: "#000", flexShrink: 0, alignSelf: "stretch" }} />
+          <div style={{ display: "flex", flex: 1, minWidth: 0, pointerEvents: "auto", alignSelf: "stretch" }}>
             {renderTeamPlayers(data.homeTeam.onCourt || [], homeColor)}
           </div>
         </div>
 
         {/* ── Row 2: Bottom info strip ── */}
-        {/* Left quarter: away team tab (click to open team stats drawer) */}
-        {/* Middle half: play-by-play ticker with game clock */}
-        {/* Right quarter: home team tab */}
-        <div style={{ display: "flex", height: "28px", pointerEvents: "auto",
-          boxShadow: "0 4px 12px rgba(0,0,0,0.7)" }}>
-
-          {/* Away team tab — shows team name, foul count or BONUS, timeout dots */}
+        <div style={{ display: "flex", height: "28px", pointerEvents: "auto", boxShadow: "0 4px 12px rgba(0,0,0,0.7)" }}>
+          {/* Away team tab */}
           <div
             onClick={() => setExpandedTeamStats(prev => {
               const next = new Set(prev)
-              // Toggle: if already open close it, if closed open it
               next.has("away") ? next.delete("away") : next.add("away")
               return next
             })}
@@ -454,50 +650,28 @@ export default function ScorebugOverlay() {
               padding: "0 10px", cursor: "pointer",
               backgroundColor: expandedTeamStats.has("away") ? `${awayColor}ff` : `${awayColor}cc`,
               backgroundImage: `linear-gradient(160deg, rgba(255,255,255,0.07) 0%, transparent 55%), linear-gradient(to bottom, rgba(255,255,255,0.05) 0%, rgba(0,0,0,0.2) 100%)`,
-              borderTop: "1px solid rgba(255,255,255,0.1)",
-              transition: "background-color 0.2s"
+              borderTop: "1px solid rgba(255,255,255,0.1)", transition: "background-color 0.2s"
             }}>
-            <span style={{ fontSize: "10px", fontWeight: 900, color: "white", whiteSpace: "nowrap" }}>
-              {data.awayTeam.tricode}
-            </span>
-            {/* Foul count — turns red if in bonus */}
-            <span style={{
-              fontSize: "9px", fontWeight: 700,
-              color: data.awayTeam.inBonus ? "#ff4757" : "rgba(255,255,255,0.7)",
-              whiteSpace: "nowrap"
-            }}>
-              {data.awayTeam.inBonus ? "BONUS" : `${data.awayTeam.fouls}F`}
-            </span>
-            <TimeoutDots count={data.awayTeam.timeouts} />
-            {/* Chevron indicates the drawer can be toggled */}
-            <span style={{
-              fontSize: "8px", color: "rgba(255,255,255,0.4)", marginLeft: "auto",
-              transform: expandedTeamStats.has("away") ? "rotate(180deg)" : "rotate(0deg)",
-              transition: "transform 0.2s"
-            }}>▲</span>
+            <span style={{ fontSize: "10px", fontWeight: 900, color: "white", whiteSpace: "nowrap" }}>{data.awayTeam.tricode}</span>
+            {/* Hide timeout dots in compact mode to save space */}
+            {!isCompact && <TimeoutDots count={data.awayTeam.timeouts} />}
+            <span style={{ fontSize: "8px", color: "rgba(255,255,255,0.4)", marginLeft: "auto", transform: expandedTeamStats.has("away") ? "rotate(180deg)" : "rotate(0deg)", transition: "transform 0.2s" }}>▲</span>
           </div>
 
-          {/* Middle: play-by-play ticker */}
+          {/* Middle play-by-play */}
           <div style={{
             flex: 2, display: "flex", alignItems: "center", justifyContent: "center",
             gap: "8px", backgroundColor: "rgba(0,0,0,0.85)",
             borderTop: "1px solid #222", padding: "0 8px", overflow: "hidden"
           }}>
             <span style={{ color: "#ff4757", fontSize: "9px", fontWeight: 900, flexShrink: 0 }}>PLAY</span>
-            {/* Game clock label for when this play happened */}
             {playClockLabel && (
-              <span style={{
-                fontSize: "9px", fontWeight: 700,
-                color: "rgba(255,255,255,0.45)", flexShrink: 0
-              }}>{playClockLabel}</span>
+              <span style={{ fontSize: "9px", fontWeight: 700, color: "rgba(255,255,255,0.45)", flexShrink: 0 }}>{playClockLabel}</span>
             )}
-            <span style={{
-              fontSize: "10px", color: "rgba(255,255,255,0.85)",
-              whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis"
-            }}>{data.latestPlay}</span>
+            <span style={{ fontSize: "10px", color: "rgba(255,255,255,0.85)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{data.latestPlay}</span>
           </div>
 
-          {/* Home team tab — same layout as away but mirrored */}
+          {/* Home team tab */}
           <div
             onClick={() => setExpandedTeamStats(prev => {
               const next = new Set(prev)
@@ -509,42 +683,23 @@ export default function ScorebugOverlay() {
               padding: "0 10px", cursor: "pointer", justifyContent: "flex-end",
               backgroundColor: expandedTeamStats.has("home") ? `${homeColor}ff` : `${homeColor}cc`,
               backgroundImage: `linear-gradient(160deg, rgba(255,255,255,0.07) 0%, transparent 55%), linear-gradient(to bottom, rgba(255,255,255,0.05) 0%, rgba(0,0,0,0.2) 100%)`,
-              borderTop: "1px solid rgba(255,255,255,0.1)",
-              transition: "background-color 0.2s"
+              borderTop: "1px solid rgba(255,255,255,0.1)", transition: "background-color 0.2s"
             }}>
-            <span style={{
-              fontSize: "8px", color: "rgba(255,255,255,0.4)", marginRight: "auto",
-              transform: expandedTeamStats.has("home") ? "rotate(180deg)" : "rotate(0deg)",
-              transition: "transform 0.2s"
-            }}>▲</span>
-            <TimeoutDots count={data.homeTeam.timeouts} />
-            <span style={{
-              fontSize: "9px", fontWeight: 700,
-              color: data.homeTeam.inBonus ? "#ff4757" : "rgba(255,255,255,0.7)",
-              whiteSpace: "nowrap"
-            }}>
-              {data.homeTeam.inBonus ? "BONUS" : `${data.homeTeam.fouls}F`}
-            </span>
-            <span style={{ fontSize: "10px", fontWeight: 900, color: "white", whiteSpace: "nowrap" }}>
-              {data.homeTeam.tricode}
-            </span>
+            <span style={{ fontSize: "8px", color: "rgba(255,255,255,0.4)", marginRight: "auto", transform: expandedTeamStats.has("home") ? "rotate(180deg)" : "rotate(0deg)", transition: "transform 0.2s" }}>▲</span>
+            {!isCompact && <TimeoutDots count={data.homeTeam.timeouts} />}
+            <span style={{ fontSize: "10px", fontWeight: 900, color: "white", whiteSpace: "nowrap" }}>{data.homeTeam.tricode}</span>
           </div>
         </div>
 
         {/* ── Row 3: Team stats drawers ── */}
-        {/* Each team occupies exactly half the screen width when open */}
-        {/* Both can be open at once, both close when clicking outside */}
         {expandedTeamStats.size > 0 && (
           <div style={{ display: "flex", pointerEvents: "auto" }}>
-            {/* Away drawer — left half only, invisible placeholder when closed so home stays right */}
             <div style={{ flex: 1, overflow: "hidden" }}>
               {expandedTeamStats.has("away")
                 ? <TeamStatsDrawer team={data.awayTeam} color={awayColor} />
-                // Empty div keeps the home drawer pinned to the right half when only home is open
                 : <div style={{ height: expandedTeamStats.has("home") ? "auto" : 0 }} />
               }
             </div>
-            {/* Home drawer — right half only, invisible placeholder when closed */}
             <div style={{ flex: 1, overflow: "hidden" }}>
               {expandedTeamStats.has("home")
                 ? <TeamStatsDrawer team={data.homeTeam} color={homeColor} />
@@ -560,14 +715,32 @@ export default function ScorebugOverlay() {
             40% { transform: scale(1.3); color: #00ff00; }
             100% { transform: scale(1); }
           }
+          @keyframes statGreenPulse {
+            0% { transform: scale(1); }
+            40% { transform: scale(1.25); color: #00ff00; text-shadow: 0 0 8px #00ff00; }
+            100% { transform: scale(1); }
+          }
+          @keyframes statRedPulse {
+            0% { transform: scale(1); }
+            40% { transform: scale(1.25); color: #ff4757; text-shadow: 0 0 8px #ff4757; }
+            100% { transform: scale(1); }
+          }
+          @keyframes statYellowPulse {
+            0% { transform: scale(1); }
+            40% { transform: scale(1.25); color: #ffdd00; text-shadow: 0 0 8px #ffdd00; }
+            100% { transform: scale(1); }
+          }
+          @keyframes statBluePulse {
+            0% { transform: scale(1); }
+            40% { transform: scale(1.25); color: #00ccff; text-shadow: 0 0 8px #00ccff; }
+            100% { transform: scale(1); }
+          }
         `}</style>
       </div>
     )
   }
 
-  // ── SCOREBUG MODE (Bottom Bar) ────────────────────────────────────────────────
-
-  // Timeout indicators shown under the score
+  // ── SCOREBUG MODE ────────────────────────────────────────────────────────────
   const renderTimeouts = (count: number) =>
     Array.from({ length: 7 }).map((_, i) => (
       <div key={i} style={{
@@ -577,7 +750,6 @@ export default function ScorebugOverlay() {
       }} />
     ))
 
-  // One half of the scorebug — mirrored for away vs home
   const TeamSide = ({ team, isAway }: { team: any, isAway: boolean }) => {
     const teamColor = NBA_COLORS[team.tricode] || "#333"
     const isScoring = scoringTricode === team.tricode
@@ -587,11 +759,11 @@ export default function ScorebugOverlay() {
 
     return (
       <div style={{ flex: 1, display: "flex", flexDirection: isAway ? "row" : "row-reverse", background: bgGradient, alignItems: "center" }}>
-        <div style={{ flex: 1, display: "flex", justifyContent: "space-evenly", alignItems: "center", padding: "0 10px" }}>
+        <div style={{ flex: 1, display: "flex", justifyContent: "space-evenly", alignItems: "center", padding: "0 10px", overflow: "hidden", minWidth: 0 }}>
           {team.onCourt?.map((p: any) => {
             const isScorer = scoringPlayerId === p.id
             return (
-              <div key={p.id} style={{ display: "flex", flexDirection: "column", alignItems: "center", width: "85px" }}>
+              <div key={p.id} style={{ display: "flex", flexDirection: "column", alignItems: "center", width: "85px", flexShrink: 1, minWidth: 0 }}>
                 <img
                   src={`https://cdn.nba.com/headshots/nba/latest/260x190/${p.id}.png`}
                   style={{
@@ -607,7 +779,9 @@ export default function ScorebugOverlay() {
                   fontSize: "12px", fontWeight: "bold", marginTop: "6px",
                   textShadow: "0 1px 2px #000",
                   color: isScorer ? "#ffdd00" : "white",
-                  transition: "color 0.3s ease"
+                  transition: "color 0.3s ease",
+                  whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                  maxWidth: "85px", textAlign: "center"
                 }}>{p.name}</span>
                 <div style={{
                   fontSize: "11px",
@@ -647,7 +821,6 @@ export default function ScorebugOverlay() {
     )
   }
 
-  // Bottom scorebug container
   return (
     <div style={{
       position: "fixed", bottom: "4%", left: "50%", transform: "translateX(-50%)",
