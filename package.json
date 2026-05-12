@@ -1,7 +1,7 @@
 {
   "name": "statbug",
   "displayName": "Statbug",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "",
   "author": "Plasmo Corp. <foss@plasmo.com>",
   "scripts": {
@@ -24,11 +24,16 @@
     "typescript": "5.3.3"
   },
   "manifest": {
-    "host_permissions": ["<all_urls>"],
     "permissions": [
+      "declarativeNetRequest",
       "storage",
-      "alarms",
       "tabs"
-    ]
+    ],
+    "host_permissions": [
+      "<all_urls>"
+    ],
+    "content_security_policy": {
+      "extension_pages": "script-src 'self'; object-src 'self'; connect-src *"
+    }
   }
 }

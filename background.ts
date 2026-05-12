@@ -1,7 +1,104 @@
 let CURRENT_GAME_ID = ""
 let latencyDelayMs = 0
 // Buffer to store historical API responses so we can artificially delay the broadcast
-let dataBuffer: { timestamp: number, payload: any }[] = []
+let dataBuffer: { timestamp: number; payload: any }[] = []
+
+const NBA_CDN_BASE = "https://cdn.nba.com/static/json/liveData"
+const NBA_S3_BASE =
+  "https://nba-prod-us-east-1-mediaops-stats.s3.amazonaws.com/NBA/liveData"
+
+const NBA_HEADERS = {
+  Accept: "application/json"
+}
+
+// NBA's CDN can reject extension-origin requests with 403s.
+// This MV3 rule makes NBA JSON calls look like they came from nba.com itself.
+const setupNbaRequestHeaders = () => {
+  const dnr = chrome.declarativeNetRequest
+  if (!dnr?.updateDynamicRules) return
+
+  dnr.updateDynamicRules(
+    {
+      removeRuleIds: [1],
+      addRules: [
+        {
+          id: 1,
+          priority: 1,
+          action: {
+            type: chrome.declarativeNetRequest.RuleActionType.MODIFY_HEADERS,
+            requestHeaders: [
+              {
+                header: "origin",
+                operation: chrome.declarativeNetRequest.HeaderOperation.REMOVE
+              },
+              {
+                header: "referer",
+                operation: chrome.declarativeNetRequest.HeaderOperation.SET,
+                value: "https://www.nba.com/"
+              }
+            ]
+          },
+          condition: {
+            regexFilter:
+              "^https://(cdn\\.nba\\.com/static/json|nba-prod-us-east-1-mediaops-stats\\.s3\\.amazonaws\\.com/NBA)/",
+            resourceTypes: [
+              chrome.declarativeNetRequest.ResourceType.XMLHTTPREQUEST
+            ]
+          }
+        }
+      ]
+    },
+    () => {
+      if (chrome.runtime.lastError) {
+        console.warn(
+          "Unable to configure NBA request headers:",
+          chrome.runtime.lastError.message
+        )
+      }
+    }
+  )
+}
+
+setupNbaRequestHeaders()
+
+// Try the CDN first, then the underlying mediaops bucket if the CDN refuses us.
+const fetchJsonFromCandidates = async (urls: string[]) => {
+  const errors: string[] = []
+
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, {
+        cache: "no-store",
+        headers: NBA_HEADERS
+      })
+
+      if (!res.ok) {
+        throw new Error(`${res.status} ${res.statusText}`.trim())
+      }
+
+      return res.json()
+    } catch (err) {
+      errors.push(`${url}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  throw new Error(`NBA API returned no usable response. ${errors.join(" | ")}`)
+}
+
+const scoreboardUrls = () => [
+  `${NBA_CDN_BASE}/scoreboard/todaysScoreboard_00.json`,
+  `${NBA_S3_BASE}/scoreboard/todaysScoreboard_00.json`
+]
+
+const boxscoreUrls = (gameId: string) => [
+  `${NBA_CDN_BASE}/boxscore/boxscore_${gameId}.json`,
+  `${NBA_S3_BASE}/boxscore/boxscore_${gameId}.json`
+]
+
+const playByPlayUrls = (gameId: string) => [
+  `${NBA_CDN_BASE}/playbyplay/playbyplay_${gameId}.json`,
+  `${NBA_S3_BASE}/playbyplay/playbyplay_${gameId}.json`
+]
 
 // Attempt to load saved preferences (game ID and sync delay) when the extension boots up
 try {
@@ -14,7 +111,7 @@ try {
 }
 
 // Listen for messages coming from the popup or content scripts
-chrome.runtime.onMessage.addListener((msg) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "CHANGE_GAME") {
     CURRENT_GAME_ID = msg.gameId
     dataBuffer = []
@@ -27,9 +124,26 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === "SET_DISPLAY_MODE") {
     chrome.tabs.query({ url: "<all_urls>" }, (tabs) => {
       for (const tab of tabs) {
-        if (tab.id) chrome.tabs.sendMessage(tab.id, { type: "SET_DISPLAY_MODE", mode: msg.mode }).catch(() => {})
+        if (tab.id)
+          chrome.tabs
+            .sendMessage(tab.id, { type: "SET_DISPLAY_MODE", mode: msg.mode })
+            .catch(() => {})
       }
     })
+  }
+
+  // Keep schedule fetches in the background worker so host permissions apply.
+  if (msg.type === "FETCH_SCHEDULE") {
+    fetchJsonFromCandidates(scoreboardUrls())
+      .then((data) => {
+        sendResponse({ success: true, data: data })
+      })
+      .catch((err) => {
+        console.error("Background Fetch Error:", err)
+        sendResponse({ success: false, error: err.message })
+      })
+
+    return true // Required to keep the channel open for the async response
   }
 })
 
@@ -48,7 +162,9 @@ const getOnCourtPlayers = (team: any) => {
       reb: p.statistics.reboundsTotal,
       ast: p.statistics.assists,
       fouls: p.statistics.foulsPersonal,
-      min: p.statistics.minutesCalculated?.replace("PT", "").replace("M", "") ?? "0",
+      min:
+        p.statistics.minutesCalculated?.replace("PT", "").replace("M", "") ??
+        "0",
       fgm: p.statistics.fieldGoalsMade,
       fga: p.statistics.fieldGoalsAttempted,
       tpm: p.statistics.threePointersMade,
@@ -68,15 +184,18 @@ const getTeamStats = (team: any) => ({
   fgm: team.statistics.fieldGoalsMade,
   fga: team.statistics.fieldGoalsAttempted,
   fgPct: team.statistics.fieldGoalsPercentage
-    ? `${(team.statistics.fieldGoalsPercentage * 100).toFixed(1)}%` : "-",
+    ? `${(team.statistics.fieldGoalsPercentage * 100).toFixed(1)}%`
+    : "-",
   tpm: team.statistics.threePointersMade,
   tpa: team.statistics.threePointersAttempted,
   tpPct: team.statistics.threePointersPercentage
-    ? `${(team.statistics.threePointersPercentage * 100).toFixed(1)}%` : "-",
+    ? `${(team.statistics.threePointersPercentage * 100).toFixed(1)}%`
+    : "-",
   ftm: team.statistics.freeThrowsMade,
   fta: team.statistics.freeThrowsAttempted,
   ftPct: team.statistics.freeThrowsPercentage
-    ? `${(team.statistics.freeThrowsPercentage * 100).toFixed(1)}%` : "-",
+    ? `${(team.statistics.freeThrowsPercentage * 100).toFixed(1)}%`
+    : "-",
   reb: team.statistics.reboundsTotal,
   oreb: team.statistics.reboundsOffensive,
   dreb: team.statistics.reboundsDefensive,
@@ -88,34 +207,29 @@ const getTeamStats = (team: any) => ({
   fastBreak: team.statistics.pointsFastBreak,
   secondChance: team.statistics.pointsSecondChance,
   benchPts: team.statistics.benchPoints,
-  foulsTeam: team.statistics.foulsTeam,
+  foulsTeam: team.statistics.foulsTeam
 })
 
 // Main function to pull live data from NBA's static CDN
 const fetchGameData = async () => {
   if (!CURRENT_GAME_ID) return
 
-  const boxUrl = `https://cdn.nba.com/static/json/liveData/boxscore/boxscore_${CURRENT_GAME_ID}.json`
-  const pbpUrl = `https://cdn.nba.com/static/json/liveData/playbyplay/playbyplay_${CURRENT_GAME_ID}.json`
-
   try {
-    const boxRes = await fetch(boxUrl)
-    const boxData = await boxRes.json()
+    const boxData = await fetchJsonFromCandidates(boxscoreUrls(CURRENT_GAME_ID))
     const game = boxData.game
 
     let actions: any[] = []
     try {
-      const pbpRes = await fetch(pbpUrl)
-      if (pbpRes.ok && pbpRes.headers.get("content-type")?.includes("application/json")) {
-        const pbpData = await pbpRes.json()
-        actions = pbpData.game?.actions || []
-      }
+      const pbpData = await fetchJsonFromCandidates(
+        playByPlayUrls(CURRENT_GAME_ID)
+      )
+      actions = pbpData.game?.actions || []
     } catch (e) {
       console.warn("PBP not available")
     }
 
     // Grab the last 5 plays with descriptions for the play-by-play ticker
-    const recentPlays: { text: string, clock: string, period: number }[] = []
+    const recentPlays: { text: string; clock: string; period: number }[] = []
     for (let i = actions.length - 1; i >= 0 && recentPlays.length < 5; i--) {
       const a = actions[i]
       if (a.description) {
@@ -128,7 +242,14 @@ const fetchGameData = async () => {
       }
     }
 
-    const latestPlay = recentPlays[0] || { text: game.gameStatus === 1 ? "Awaiting tip-off..." : "Waiting for play data...", clock: "", period: 0 }
+    const latestPlay = recentPlays[0] || {
+      text:
+        game.gameStatus === 1
+          ? "Awaiting tip-off..."
+          : "Waiting for play data...",
+      clock: "",
+      period: 0
+    }
 
     const payload = {
       type: "UPDATE_BOXSCORE",
@@ -164,7 +285,6 @@ const fetchGameData = async () => {
 
     dataBuffer.push({ timestamp: Date.now(), payload })
     if (dataBuffer.length > 120) dataBuffer.shift()
-
   } catch (e) {
     console.error("Boxscore fetch failed", e)
   }
@@ -178,11 +298,15 @@ setInterval(() => {
   let smallestDiff = Infinity
   for (const item of dataBuffer) {
     const diff = Math.abs(item.timestamp - targetTime)
-    if (diff < smallestDiff) { smallestDiff = diff; closestPayload = item.payload }
+    if (diff < smallestDiff) {
+      smallestDiff = diff
+      closestPayload = item.payload
+    }
   }
   chrome.tabs.query({ url: "*://*.nba.com/*" }, (tabs) => {
     for (const tab of tabs) {
-      if (tab.id) chrome.tabs.sendMessage(tab.id, closestPayload).catch(() => {})
+      if (tab.id)
+        chrome.tabs.sendMessage(tab.id, closestPayload).catch(() => {})
     }
   })
 }, 1000)

@@ -3,6 +3,11 @@ import { useEffect, useState } from "react"
 // The three display modes available to the user
 type DisplayMode = "off" | "scorebug" | "statbug"
 
+const SCOREBOARD_URL =
+  "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
+const SCOREBOARD_FALLBACK_URL =
+  "https://nba-prod-us-east-1-mediaops-stats.s3.amazonaws.com/NBA/liveData/scoreboard/todaysScoreboard_00.json"
+
 export default function GameSelectorPopup() {
   // --- State Management ---
   const [games, setGames] = useState<any[]>([])
@@ -14,26 +19,88 @@ export default function GameSelectorPopup() {
   const [displayMode, setDisplayMode] = useState<DisplayMode>("scorebug")
 
   useEffect(() => {
-    const fetchSchedule = async () => {
+    const loadSchedule = (data: any) => {
+      setGames(data.scoreboard?.games || [])
+      setLoading(false)
+    }
+
+    const fetchScheduleDirectly = async (reason?: string) => {
+      console.warn(
+        "Background schedule fetch failed, trying direct fetch:",
+        reason
+      )
+
       try {
-        const response = await fetch("https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json")
-        const data = await response.json()
-        setGames(data.scoreboard?.games || [])
-        setLoading(false)
-      } catch (e) {
-        setErrorMsg("Failed to reach NBA servers.")
+        // Mirrors the background fetch fallback so the popup can still load games
+        // if the service worker is asleep or Chrome drops the message response.
+        const responses = await Promise.allSettled(
+          [SCOREBOARD_URL, SCOREBOARD_FALLBACK_URL].map(async (url) => {
+            const response = await fetch(url, {
+              cache: "no-store",
+              headers: { Accept: "application/json" }
+            })
+
+            if (!response.ok) {
+              throw new Error(`NBA API returned ${response.status}`)
+            }
+
+            return response.json()
+          })
+        )
+
+        const successfulResponse = responses.find(
+          (result): result is PromiseFulfilledResult<any> =>
+            result.status === "fulfilled"
+        )
+
+        if (!successfulResponse) {
+          throw new Error("NBA API returned no usable response")
+        }
+
+        loadSchedule(successfulResponse.value)
+      } catch (err) {
+        console.error("Direct schedule fetch failed:", err)
+        setErrorMsg(
+          reason
+            ? `Failed to reach NBA servers. ${reason}`
+            : "Failed to reach NBA servers."
+        )
         setLoading(false)
       }
     }
+
+    const fetchSchedule = () => {
+      // Ask the background script to do the heavy lifting
+      chrome.runtime.sendMessage({ type: "FETCH_SCHEDULE" }, (response) => {
+        if (chrome.runtime.lastError) {
+          const reason = chrome.runtime.lastError.message
+          console.error("Popup Error:", reason)
+          fetchScheduleDirectly(reason)
+          return
+        }
+
+        if (response && response.success) {
+          loadSchedule(response.data)
+        } else {
+          const reason = response?.error || "Background script did not respond."
+          console.error("Popup Error:", reason)
+          fetchScheduleDirectly(reason)
+        }
+      })
+    }
+
     fetchSchedule()
 
     try {
       if (chrome?.storage?.local) {
-        chrome.storage.local.get(["selectedGameId", "delaySeconds", "displayMode"], (result) => {
-          if (result.selectedGameId) setSelectedGame(result.selectedGameId)
-          if (result.delaySeconds) setLatencySeconds(result.delaySeconds)
-          if (result.displayMode) setDisplayMode(result.displayMode)
-        })
+        chrome.storage.local.get(
+          ["selectedGameId", "delaySeconds", "displayMode"],
+          (result) => {
+            if (result.selectedGameId) setSelectedGame(result.selectedGameId)
+            if (result.delaySeconds) setLatencySeconds(result.delaySeconds)
+            if (result.displayMode) setDisplayMode(result.displayMode)
+          }
+        )
       }
     } catch (err) {
       console.warn("Storage API not available", err)
@@ -42,13 +109,19 @@ export default function GameSelectorPopup() {
 
   const handleSelectGame = (gameId: string) => {
     setSelectedGame(gameId)
-    if (chrome?.storage?.local) chrome.storage.local.set({ selectedGameId: gameId })
-    if (chrome?.runtime?.sendMessage) chrome.runtime.sendMessage({ type: "CHANGE_GAME", gameId }).catch(() => {})
+    if (chrome?.storage?.local)
+      chrome.storage.local.set({ selectedGameId: gameId })
+    if (chrome?.runtime?.sendMessage)
+      chrome.runtime
+        .sendMessage({ type: "CHANGE_GAME", gameId })
+        .catch(() => {})
   }
 
   const handleSetLatency = () => {
     if (chrome?.runtime?.sendMessage) {
-      chrome.runtime.sendMessage({ type: "SET_LATENCY", seconds: latencySeconds }).catch(() => {})
+      chrome.runtime
+        .sendMessage({ type: "SET_LATENCY", seconds: latencySeconds })
+        .catch(() => {})
       setLatencySaved(true)
       setTimeout(() => setLatencySaved(false), 2000)
     }
@@ -57,10 +130,13 @@ export default function GameSelectorPopup() {
   const handleSetDisplayMode = (mode: DisplayMode) => {
     setDisplayMode(mode)
     if (chrome?.storage?.local) chrome.storage.local.set({ displayMode: mode })
-    if (chrome?.runtime?.sendMessage) chrome.runtime.sendMessage({ type: "SET_DISPLAY_MODE", mode }).catch(() => {})
+    if (chrome?.runtime?.sendMessage)
+      chrome.runtime
+        .sendMessage({ type: "SET_DISPLAY_MODE", mode })
+        .catch(() => {})
   }
 
-  const modeButtons: { label: string, value: DisplayMode }[] = [
+  const modeButtons: { label: string; value: DisplayMode }[] = [
     { label: "Off", value: "off" },
     { label: "Scorebug", value: "scorebug" },
     // Renamed from "Player Stats" to "Statbug"
@@ -68,24 +144,48 @@ export default function GameSelectorPopup() {
   ]
 
   return (
-    <div style={{ width: "320px", minHeight: "200px", backgroundColor: "#0f0f14", color: "white", fontFamily: "sans-serif", padding: "15px" }}>
-
+    <div
+      style={{
+        width: "320px",
+        minHeight: "200px",
+        backgroundColor: "#0f0f14",
+        color: "white",
+        fontFamily: "sans-serif",
+        padding: "15px"
+      }}>
       {/* DISPLAY MODE TOGGLE */}
-      <div style={{ backgroundColor: "#1a1a24", padding: "12px", borderRadius: "8px", marginBottom: "16px", border: "1px solid #333" }}>
-        <h3 style={{ margin: "0 0 10px 0", fontSize: "14px", color: "#00ff00" }}>Display Mode</h3>
+      <div
+        style={{
+          backgroundColor: "#1a1a24",
+          padding: "12px",
+          borderRadius: "8px",
+          marginBottom: "16px",
+          border: "1px solid #333"
+        }}>
+        <h3
+          style={{ margin: "0 0 10px 0", fontSize: "14px", color: "#00ff00" }}>
+          Display Mode
+        </h3>
         <div style={{ display: "flex", gap: "6px" }}>
           {modeButtons.map(({ label, value }) => (
             <button
               key={value}
               onClick={() => handleSetDisplayMode(value)}
               style={{
-                flex: 1, padding: "8px 4px", fontSize: "12px", fontWeight: "bold",
+                flex: 1,
+                padding: "8px 4px",
+                fontSize: "12px",
+                fontWeight: "bold",
                 backgroundColor: displayMode === value ? "#00ff00" : "#0f0f14",
                 color: displayMode === value ? "black" : "#888",
-                border: displayMode === value ? "2px solid #00ff00" : "2px solid #333",
-                borderRadius: "6px", cursor: "pointer", transition: "all 0.2s"
-              }}
-            >
+                border:
+                  displayMode === value
+                    ? "2px solid #00ff00"
+                    : "2px solid #333",
+                borderRadius: "6px",
+                cursor: "pointer",
+                transition: "all 0.2s"
+              }}>
               {label}
             </button>
           ))}
@@ -93,39 +193,90 @@ export default function GameSelectorPopup() {
       </div>
 
       {/* LATENCY PANEL */}
-      <div style={{ backgroundColor: "#1a1a24", padding: "12px", borderRadius: "8px", marginBottom: "16px", border: "1px solid #333" }}>
-        <h3 style={{ margin: "0 0 8px 0", fontSize: "14px", color: "#00ff00" }}>⏱ TV Delay</h3>
+      <div
+        style={{
+          backgroundColor: "#1a1a24",
+          padding: "12px",
+          borderRadius: "8px",
+          marginBottom: "16px",
+          border: "1px solid #333"
+        }}>
+        <h3 style={{ margin: "0 0 8px 0", fontSize: "14px", color: "#00ff00" }}>
+          ⏱ TV Delay
+        </h3>
         <p style={{ fontSize: "11px", color: "#888", margin: "0 0 10px 0" }}>
           How many seconds behind is your TV? Set to 0 for live.
         </p>
         <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
           <input
-            type="number" min={0} max={120} value={latencySeconds}
+            type="number"
+            min={0}
+            max={120}
+            value={latencySeconds}
             onChange={(e) => setLatencySeconds(Number(e.target.value))}
-            style={{ width: "70px", padding: "6px", backgroundColor: "#0f0f14", color: "white", border: "1px solid #444", borderRadius: "4px", textAlign: "center", fontSize: "16px" }}
+            style={{
+              width: "70px",
+              padding: "6px",
+              backgroundColor: "#0f0f14",
+              color: "white",
+              border: "1px solid #444",
+              borderRadius: "4px",
+              textAlign: "center",
+              fontSize: "16px"
+            }}
           />
           <span style={{ color: "#888", fontSize: "13px" }}>seconds</span>
           <button
             onClick={handleSetLatency}
-            style={{ flex: 1, padding: "6px", backgroundColor: latencySaved ? "#005500" : "#00ff00", color: latencySaved ? "#00ff00" : "black", border: "none", borderRadius: "4px", fontWeight: "bold", cursor: "pointer", transition: "all 0.3s" }}
-          >
+            style={{
+              flex: 1,
+              padding: "6px",
+              backgroundColor: latencySaved ? "#005500" : "#00ff00",
+              color: latencySaved ? "#00ff00" : "black",
+              border: "none",
+              borderRadius: "4px",
+              fontWeight: "bold",
+              cursor: "pointer",
+              transition: "all 0.3s"
+            }}>
             {latencySaved ? "SAVED ✓" : "SET"}
           </button>
         </div>
       </div>
 
       {/* GAME LIST */}
-      <h2 style={{ margin: "0 0 15px 0", fontSize: "18px", color: "white", borderBottom: "1px solid #333", paddingBottom: "10px" }}>
+      <h2
+        style={{
+          margin: "0 0 15px 0",
+          fontSize: "18px",
+          color: "white",
+          borderBottom: "1px solid #333",
+          paddingBottom: "10px"
+        }}>
         Live Games
       </h2>
       {loading ? (
-        <div style={{ textAlign: "center", color: "#888", marginTop: "20px" }}>Loading today's games...</div>
+        <div style={{ textAlign: "center", color: "#888", marginTop: "20px" }}>
+          Loading today's games...
+        </div>
       ) : errorMsg ? (
-        <div style={{ textAlign: "center", color: "#ff4757", marginTop: "20px" }}>{errorMsg}</div>
+        <div
+          style={{ textAlign: "center", color: "#ff4757", marginTop: "20px" }}>
+          {errorMsg}
+        </div>
       ) : games.length === 0 ? (
-        <div style={{ textAlign: "center", color: "#888", marginTop: "20px" }}>No games scheduled today.</div>
+        <div style={{ textAlign: "center", color: "#888", marginTop: "20px" }}>
+          No games scheduled today.
+        </div>
       ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: "10px", maxHeight: "300px", overflowY: "auto" }}>
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "10px",
+            maxHeight: "300px",
+            overflowY: "auto"
+          }}>
           {games.map((game) => {
             const isSelected = selectedGame === game.gameId
             return (
@@ -133,19 +284,46 @@ export default function GameSelectorPopup() {
                 key={game.gameId}
                 onClick={() => handleSelectGame(game.gameId)}
                 style={{
-                  display: "flex", justifyContent: "space-between", alignItems: "center",
-                  padding: "12px", backgroundColor: isSelected ? "rgba(0, 255, 0, 0.1)" : "#1a1a24",
-                  border: isSelected ? "2px solid #00ff00" : "2px solid transparent",
-                  borderRadius: "8px", color: "white", cursor: "pointer", transition: "all 0.2s"
-                }}
-              >
-                <div style={{ display: "flex", gap: "15px", alignItems: "center" }}>
-                  <span style={{ fontWeight: "bold", fontSize: "16px" }}>{game.awayTeam.teamTricode}</span>
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  padding: "12px",
+                  backgroundColor: isSelected
+                    ? "rgba(0, 255, 0, 0.1)"
+                    : "#1a1a24",
+                  border: isSelected
+                    ? "2px solid #00ff00"
+                    : "2px solid transparent",
+                  borderRadius: "8px",
+                  color: "white",
+                  cursor: "pointer",
+                  transition: "all 0.2s"
+                }}>
+                <div
+                  style={{
+                    display: "flex",
+                    gap: "15px",
+                    alignItems: "center"
+                  }}>
+                  <span style={{ fontWeight: "bold", fontSize: "16px" }}>
+                    {game.awayTeam.teamTricode}
+                  </span>
                   <span style={{ color: "#666", fontSize: "12px" }}>@</span>
-                  <span style={{ fontWeight: "bold", fontSize: "16px" }}>{game.homeTeam.teamTricode}</span>
+                  <span style={{ fontWeight: "bold", fontSize: "16px" }}>
+                    {game.homeTeam.teamTricode}
+                  </span>
                 </div>
-                <div style={{ fontSize: "12px", color: isSelected ? "#00ff00" : "#888", fontWeight: "bold" }}>
-                  {game.gameStatus === 1 ? "PRE" : game.gameStatus === 2 ? "LIVE" : "FINAL"}
+                <div
+                  style={{
+                    fontSize: "12px",
+                    color: isSelected ? "#00ff00" : "#888",
+                    fontWeight: "bold"
+                  }}>
+                  {game.gameStatus === 1
+                    ? "PRE"
+                    : game.gameStatus === 2
+                      ? "LIVE"
+                      : "FINAL"}
                 </div>
               </button>
             )
