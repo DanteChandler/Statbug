@@ -11,6 +11,14 @@ const NBA_HEADERS = {
   Accept: "application/json"
 }
 
+const DNR_ACTION_MODIFY_HEADERS =
+  "modifyHeaders" as chrome.declarativeNetRequest.RuleActionType
+const DNR_HEADER_REMOVE =
+  "remove" as chrome.declarativeNetRequest.HeaderOperation
+const DNR_HEADER_SET = "set" as chrome.declarativeNetRequest.HeaderOperation
+const DNR_RESOURCE_XHR =
+  "xmlhttprequest" as chrome.declarativeNetRequest.ResourceType
+
 // NBA's CDN can reject extension-origin requests with 403s.
 // This MV3 rule makes NBA JSON calls look like they came from nba.com itself.
 const setupNbaRequestHeaders = () => {
@@ -25,15 +33,15 @@ const setupNbaRequestHeaders = () => {
           id: 1,
           priority: 1,
           action: {
-            type: chrome.declarativeNetRequest.RuleActionType.MODIFY_HEADERS,
+            type: DNR_ACTION_MODIFY_HEADERS,
             requestHeaders: [
               {
                 header: "origin",
-                operation: chrome.declarativeNetRequest.HeaderOperation.REMOVE
+                operation: DNR_HEADER_REMOVE
               },
               {
                 header: "referer",
-                operation: chrome.declarativeNetRequest.HeaderOperation.SET,
+                operation: DNR_HEADER_SET,
                 value: "https://www.nba.com/"
               }
             ]
@@ -41,9 +49,7 @@ const setupNbaRequestHeaders = () => {
           condition: {
             regexFilter:
               "^https://(cdn\\.nba\\.com/static/json|nba-prod-us-east-1-mediaops-stats\\.s3\\.amazonaws\\.com/NBA)/",
-            resourceTypes: [
-              chrome.declarativeNetRequest.ResourceType.XMLHTTPREQUEST
-            ]
+            resourceTypes: [DNR_RESOURCE_XHR]
           }
         }
       ]

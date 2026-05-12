@@ -8,6 +8,30 @@ const SCOREBOARD_URL =
 const SCOREBOARD_FALLBACK_URL =
   "https://nba-prod-us-east-1-mediaops-stats.s3.amazonaws.com/NBA/liveData/scoreboard/todaysScoreboard_00.json"
 
+const fetchScheduleJson = async () => {
+  const urls = [SCOREBOARD_URL, SCOREBOARD_FALLBACK_URL]
+  const errors: string[] = []
+
+  for (const url of urls) {
+    try {
+      const response = await fetch(url, {
+        cache: "no-store",
+        headers: { Accept: "application/json" }
+      })
+
+      if (!response.ok) {
+        throw new Error(`NBA API returned ${response.status}`)
+      }
+
+      return response.json()
+    } catch (err) {
+      errors.push(`${url}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  throw new Error(`NBA API returned no usable response. ${errors.join(" | ")}`)
+}
+
 export default function GameSelectorPopup() {
   // --- State Management ---
   const [games, setGames] = useState<any[]>([])
@@ -33,31 +57,7 @@ export default function GameSelectorPopup() {
       try {
         // Mirrors the background fetch fallback so the popup can still load games
         // if the service worker is asleep or Chrome drops the message response.
-        const responses = await Promise.allSettled(
-          [SCOREBOARD_URL, SCOREBOARD_FALLBACK_URL].map(async (url) => {
-            const response = await fetch(url, {
-              cache: "no-store",
-              headers: { Accept: "application/json" }
-            })
-
-            if (!response.ok) {
-              throw new Error(`NBA API returned ${response.status}`)
-            }
-
-            return response.json()
-          })
-        )
-
-        const successfulResponse = responses.find(
-          (result): result is PromiseFulfilledResult<any> =>
-            result.status === "fulfilled"
-        )
-
-        if (!successfulResponse) {
-          throw new Error("NBA API returned no usable response")
-        }
-
-        loadSchedule(successfulResponse.value)
+        loadSchedule(await fetchScheduleJson())
       } catch (err) {
         console.error("Direct schedule fetch failed:", err)
         setErrorMsg(
